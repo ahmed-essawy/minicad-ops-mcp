@@ -6,7 +6,14 @@ export interface Env {
 	MCP_OBJECT: DurableObjectNamespace;
 	WP_BASE_URL: string; // e.g. https://minicad.io  (no trailing slash)
 	WP_OPS_KEY: string; // matches the MC_OPS_BRIDGE_KEY constant in wp-config.php
-	MCP_AUTH_TOKEN: string; // bearer token Claude must send to reach this server
+	MCP_PATH_SECRET: string; // long random string — the ONLY thing gating access to this server.
+	// Claude's custom-connector flow doesn't support user-pasted bearer tokens
+	// yet (only OAuth or no-auth), so instead of an Authorization header this
+	// server folds its secret into the URL path itself: the real MCP endpoint
+	// is /mcp/<MCP_PATH_SECRET>, not /mcp. Anything else gets a plain 404 —
+	// never a 401 — so Claude never attempts (and fails) an OAuth handshake.
+	// Treat this value exactly like a password: whoever has the full URL has
+	// complete read/write access to orders, leads, chat, and posts.
 }
 
 /* ── WordPress REST helper ──────────────────────────────────────────
@@ -351,10 +358,27 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		const auth = request.headers.get("Authorization") ?? "";
-		if (auth !== `Bearer ${env.MCP_AUTH_TOKEN}`) {
-			return new Response("Unauthorized", { status: 401 });
+		const url = new URL(request.url);
+		const securedPath = `/mcp/${env.MCP_PATH_SECRET}`;
+
+		// Anything that isn't exactly our secret path gets a plain 404 — never
+		// a 401. A 401 would make Claude think this server requires OAuth and
+		// try (and fail) to auto-discover/register an OAuth client, which is
+		// exactly the error this replaced. A 404 just looks like "no such
+		// route," so Claude treats a request to the correct secret URL as a
+		// normal, fully-open (no-auth) MCP connection.
+		if (!url.pathname.startsWith(securedPath)) {
+			return new Response("Not found", { status: 404 });
 		}
-		return MiniCadOpsMCP.serve("/mcp").fetch(request, env, ctx);
+
+		// Rewrite the path so the MCP handler (bound to "/mcp") sees a normal
+		// "/mcp" request once the secret prefix has already been checked.
+		// `new Request(newUrl, originalRequest)` clones method/headers/body
+		// from the original request onto the new URL.
+		const innerUrl = new URL(request.url);
+		innerUrl.pathname = "/mcp" + url.pathname.slice(securedPath.length);
+		const innerRequest = new Request(innerUrl.toString(), request);
+
+		return MiniCadOpsMCP.serve("/mcp").fetch(innerRequest, env, ctx);
 	},
 } satisfies ExportedHandler<Env>;
