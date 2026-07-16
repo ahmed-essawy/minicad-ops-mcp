@@ -1,0 +1,20 @@
+{
+	"name": "minicad-ops-mcp",
+	"version": "1.0.0",
+	"private": true,
+	"scripts": {
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev",
+		"secrets": "echo 'Run: npx wrangler secret put WP_BASE_URL / WP_APP_USER / WP_APP_PASSWORD / MCP_AUTH_TOKEN'"
+	},
+	"dependencies": {
+		"agents": "^0.3.0",
+		"@modelcontextprotocol/sdk": "^1.12.0",
+		"zod": "^3.23.8"
+	},
+	"devDependencies": {
+		"wrangler": "^4.20.0",
+		"typescript": "^5.5.4",
+		"@cloudflare/workers-types": "^4.20250712.0"
+	}
+}
