@@ -602,6 +602,73 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			}
 		);
 
+		/* ── FAQs — mc_faqs has no natural unique key (question text can
+		 * repeat), so update/delete address a row by its 0-based position.
+		 * Get the current list/order from mc_options_get's mc_faqs value
+		 * first. ── */
+		this.server.tool(
+			"mc_faq_manage",
+			"Create, update, or delete a FAQ entry. For 'update'/'delete', pass the 0-based index of the FAQ from mc_options_get's mc_faqs value — order can shift if the list changes, so re-check the index if unsure.",
+			{
+				action: z.enum(["create", "update", "delete"]),
+				index: z.number().int().min(0).optional().describe("Required for update/delete — 0-based position in the current mc_faqs list"),
+				category: z.string().optional().describe("e.g. 'General', 'Pricing', 'Delivery'"),
+				question: z.string().optional().describe("Required for create"),
+				answer: z.string().optional().describe("Required for create. HTML is allowed."),
+				active: z.boolean().optional(),
+			},
+			{ readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+			async ({ action, index, category, question, answer, active }) => {
+				if (action === "create") {
+					if (!question || !answer) {
+						return toolError(400, { message: "question and answer are required to create a FAQ." });
+					}
+					const r = await wp(env, `/faqs`, { method: "POST", body: { category, question, answer, active } });
+					return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+				}
+				if (index === undefined) {
+					return toolError(400, { message: "index is required for update/delete — get it from mc_options_get's mc_faqs value." });
+				}
+				if (action === "delete") {
+					const r = await wp(env, `/faqs/${index}/delete`, { method: "POST" });
+					return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+				}
+				const r = await wp(env, `/faqs/${index}`, { method: "POST", body: { category, question, answer, active } });
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		/* ── Brands — matched by name (case-insensitive), same pattern as
+		 * coupons' code. ── */
+		this.server.tool(
+			"mc_brand_manage",
+			"Create, update, or delete a client/partner brand logo entry. 'name' identifies the brand (case-insensitive) for update/delete; use new_name to rename one.",
+			{
+				action: z.enum(["create", "update", "delete"]),
+				name: z.string().min(1).describe("Brand name — required always: the new brand's name for create, or the existing brand to match for update/delete"),
+				logo: z.string().optional().describe("Logo image URL"),
+				url: z.string().optional().describe("Brand's website URL"),
+				new_name: z.string().optional().describe("Update only: rename the brand to this"),
+			},
+			{ readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+			async ({ action, name, logo, url, new_name }) => {
+				if (action === "create") {
+					const r = await wp(env, `/brands`, { method: "POST", body: { name, logo, url } });
+					return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+				}
+				if (action === "delete") {
+					const r = await wp(env, `/brands/${encodeURIComponent(name)}/delete`, { method: "POST" });
+					return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+				}
+				const body: Record<string, unknown> = {};
+				if (new_name !== undefined) body.name = new_name;
+				if (logo !== undefined) body.logo = logo;
+				if (url !== undefined) body.url = url;
+				const r = await wp(env, `/brands/${encodeURIComponent(name)}`, { method: "POST", body });
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
 		/* ── WordPress posts — via the bridge plugin's own /posts routes,
 		 * which call wp_insert_post()/wp_update_post() directly. This avoids
 		 * any dependency on WordPress's wp/v2 REST auth (Application
