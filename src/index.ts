@@ -509,6 +509,99 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			}
 		);
 
+		/* ── Pricing — re-price one package/extra by slug without touching
+		 * the rest of the catalog. Look up slugs and current prices first
+		 * with mc_options_get (keys: mc_packages, mc_extras). ── */
+		this.server.tool(
+			"mc_package_reprice",
+			"Change the price (and optionally the delivery-timeline prices) of one package, found by its slug — every other package and field is left untouched. Get current slugs/prices from mc_options_get's mc_packages value first.",
+			{
+				slug: z.string().min(1).describe("Package slug, e.g. 'basic' (see mc_packages via mc_options_get)"),
+				price: z.number().nonnegative().optional().describe("New base price"),
+				timelines: z
+					.array(z.object({ label: z.string(), free: z.boolean().optional(), price: z.number().nonnegative() }))
+					.optional()
+					.describe("Replaces the package's delivery-timeline price tiers, e.g. [{ label: '5 days', free: true, price: 0 }, { label: '2 days', price: 20 }]"),
+			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+			async ({ slug, price, timelines }) => {
+				if (price === undefined && timelines === undefined) {
+					return toolError(400, { message: "Provide price and/or timelines." });
+				}
+				const r = await wp(env, `/packages/reprice`, { method: "POST", body: { slug, price, timelines } });
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		this.server.tool(
+			"mc_extra_reprice",
+			"Change the price of one extra service, found by its slug — every other extra is left untouched. Get current slugs/prices from mc_options_get's mc_extras value first.",
+			{
+				slug: z.string().min(1).describe("Extra slug, e.g. 'priority' (see mc_extras via mc_options_get)"),
+				price: z.number().nonnegative(),
+			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+			async ({ slug, price }) => {
+				const r = await wp(env, `/extras/reprice`, { method: "POST", body: { slug, price } });
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		/* ── Coupons — create/update/delete by code, e.g. for a seasonal
+		 * promotion. Only the matching coupon row is touched; the rest of
+		 * the coupon list is left untouched. ── */
+		this.server.tool(
+			"mc_coupon_create",
+			"Create a new discount coupon (e.g. for a seasonal promotion or event). Fails if the code already exists — use mc_coupon_update instead.",
+			{
+				code: z.string().min(1).describe("Coupon code, e.g. 'SUMMER25' (case-insensitive, stored uppercase)"),
+				type: z.enum(["percent", "fixed"]).default("percent"),
+				amount: z.number().positive().describe("Discount amount — a percentage (0-100) if type='percent', or a flat currency amount if type='fixed'"),
+				name: z.string().optional().describe("Display name; defaults to the code"),
+				active: z.boolean().optional().describe("Defaults to true"),
+				auto_apply: z.boolean().optional().describe("Apply automatically at checkout without the customer entering the code"),
+				expires: z.string().optional().describe("Expiry date, YYYY-MM-DD. Leave unset for no expiry."),
+			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+			async ({ code, type, amount, name, active, auto_apply, expires }) => {
+				const r = await wp(env, `/coupons`, {
+					method: "POST",
+					body: { code, type, amount, name, active, auto_apply, expires },
+				});
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		this.server.tool(
+			"mc_coupon_update",
+			"Update an existing coupon's amount, type, active state, auto_apply, expiry, or display name, found by its code.",
+			{
+				code: z.string().min(1),
+				type: z.enum(["percent", "fixed"]).optional(),
+				amount: z.number().positive().optional(),
+				name: z.string().optional(),
+				active: z.boolean().optional().describe("Set to false to deactivate a coupon, e.g. once a promotion ends"),
+				auto_apply: z.boolean().optional(),
+				expires: z.string().optional().describe("Expiry date, YYYY-MM-DD"),
+			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+			async ({ code, ...fields }) => {
+				const r = await wp(env, `/coupons/${encodeURIComponent(code)}`, { method: "POST", body: fields });
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		this.server.tool(
+			"mc_coupon_delete",
+			"Permanently remove a coupon by code, e.g. once a seasonal promotion has ended.",
+			{ code: z.string().min(1) },
+			{ readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+			async ({ code }) => {
+				const r = await wp(env, `/coupons/${encodeURIComponent(code)}/delete`, { method: "POST" });
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
 		/* ── WordPress posts — via the bridge plugin's own /posts routes,
 		 * which call wp_insert_post()/wp_update_post() directly. This avoids
 		 * any dependency on WordPress's wp/v2 REST auth (Application
