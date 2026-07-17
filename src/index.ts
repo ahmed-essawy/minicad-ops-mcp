@@ -82,14 +82,20 @@ async function wp(
 }
 
 function toolResult(payload: unknown) {
-	// structuredContent must be a JSON object, not a bare array — guard here
-	// in addition to the WordPress side returning objects, so a future
-	// upstream regression degrades to a wrapped array instead of an MCP
-	// validation error.
-	const structured = Array.isArray(payload) ? { items: payload } : payload;
+	// structuredContent must be a JSON object, not a bare array or null —
+	// guard here in addition to the WordPress side returning objects, so a
+	// future upstream regression (including an empty response body, which
+	// wp() turns into null) degrades gracefully instead of hitting the same
+	// MCP "expected record" validation error this guard exists to prevent.
+	let structured: unknown = payload;
+	if (payload == null) {
+		structured = {};
+	} else if (Array.isArray(payload)) {
+		structured = { items: payload };
+	}
 	return {
 		content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
-		structuredContent: structured as unknown as Record<string, unknown>,
+		structuredContent: structured as Record<string, unknown>,
 	};
 }
 
