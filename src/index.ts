@@ -18,6 +18,17 @@ export interface Env {
 	// updates, and a read-only DB query.
 }
 
+// Every tool that isn't purely read-only (readOnlyHint !== true) requires an
+// explicit `confirm: true` argument, enforced by zod (z.literal(true)) so a
+// call missing it fails schema validation before the handler ever runs. This
+// is a code-level speed bump, not a human-approval gate — the MCP protocol
+// gives a server no channel to a person's screen, so whether a client asks a
+// human before calling a write tool is entirely up to that client's own
+// permission settings. readOnlyHint/destructiveHint on every tool below are
+// the signal a well-behaved client can use to decide that on its own.
+
+const WP_FETCH_TIMEOUT_MS = 20_000;
+
 /* ── WordPress REST helper ──────────────────────────────────────────
  * Calls the MiniCAD Ops Bridge plugin's custom routes (minicad-ops/v1/...)
  * only — not WordPress's own wp/v2 API. Auth is a shared secret sent as
@@ -34,15 +45,30 @@ async function wp(
 	const base = env.WP_BASE_URL.replace(/\/+$/, "");
 	const url = `${base}/wp-json/minicad-ops/v1${path}`;
 
-	const res = await fetch(url, {
-		method: init.method ?? "GET",
-		headers: {
-			"X-MC-Ops-Key": env.WP_OPS_KEY,
-			"Content-Type": "application/json",
-			Accept: "application/json",
-		},
-		body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
-	});
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), WP_FETCH_TIMEOUT_MS);
+
+	let res: Response;
+	try {
+		res = await fetch(url, {
+			method: init.method ?? "GET",
+			headers: {
+				"X-MC-Ops-Key": env.WP_OPS_KEY,
+				"Content-Type": "application/json",
+				Accept: "application/json",
+			},
+			body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
+			signal: controller.signal,
+		});
+	} catch (err) {
+		const message =
+			err instanceof Error && err.name === "AbortError"
+				? `Request to WordPress timed out after ${WP_FETCH_TIMEOUT_MS / 1000}s (${path}).`
+				: `Could not reach WordPress at ${path}: ${err instanceof Error ? err.message : String(err)}`;
+		return { ok: false, status: 0, data: { message } };
+	} finally {
+		clearTimeout(timeout);
+	}
 
 	let data: unknown = null;
 	const text = await res.text();
@@ -56,9 +82,20 @@ async function wp(
 }
 
 function toolResult(payload: unknown) {
+	// structuredContent must be a JSON object, not a bare array or null —
+	// guard here in addition to the WordPress side returning objects, so a
+	// future upstream regression (including an empty response body, which
+	// wp() turns into null) degrades gracefully instead of hitting the same
+	// MCP "expected record" validation error this guard exists to prevent.
+	let structured: unknown = payload;
+	if (payload == null) {
+		structured = {};
+	} else if (Array.isArray(payload)) {
+		structured = { items: payload };
+	}
 	return {
 		content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
-		structuredContent: payload as unknown as Record<string, unknown>,
+		structuredContent: structured as Record<string, unknown>,
 	};
 }
 
@@ -84,7 +121,7 @@ const qs = (params: Record<string, string | number | undefined>) => {
 };
 
 export class MiniCadOpsMCP extends McpAgent<Env> {
-	server = new McpServer({ name: "minicad-ops-mcp", version: "1.1.0" });
+	server = new McpServer({ name: "minicad-ops-mcp", version: "1.2.0" });
 
 	async init() {
 		const env = this.env;
@@ -94,6 +131,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"mc_status",
 			"Snapshot of the MiniCAD site: count of new orders, unassigned open chats, new leads, and total contacts.",
 			{},
+			{ readOnlyHint: true, openWorldHint: true },
 			async () => {
 				const r = await wp(env, "/status");
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -112,6 +150,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 				page: z.number().int().min(1).optional(),
 				per_page: z.number().int().min(1).max(100).optional(),
 			},
+			{ readOnlyHint: true, openWorldHint: true },
 			async ({ status, payment_status, search, since, page, per_page }) => {
 				const query = qs({ status, payment_status, search, since, page, per_page });
 				const r = await wp(env, `/orders${query}`);
@@ -123,6 +162,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"mc_order_get",
 			"Get full detail for one order by its numeric row ID, including notes, payments, invoices, and activity timeline.",
 			{ id: z.number().int().describe("Order row ID") },
+			{ readOnlyHint: true, openWorldHint: true },
 			async ({ id }) => {
 				const r = await wp(env, `/orders/${id}`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -131,7 +171,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"mc_order_set_status",
-			"Change an order's status. Mirrors the admin dashboard action exactly (logs the transition, adds a system note, and triggers the same email/WhatsApp notifications).",
+			"Change an order's status. Mirrors the admin dashboard action exactly (logs the transition, adds a system note, and triggers the same email/WhatsApp notifications). Requires confirm:true.",
 			{
 				id: z.number().int(),
 				status: z.enum([
@@ -143,7 +183,9 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 					"completed",
 					"cancelled",
 				]),
+				confirm: z.literal(true),
 			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
 			async ({ id, status }) => {
 				const r = await wp(env, `/orders/${id}/status`, {
 					method: "POST",
@@ -155,8 +197,9 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"mc_order_add_note",
-			"Add a manual note to an order's internal timeline (attributed to 'Claude (Ops MCP)').",
-			{ id: z.number().int(), content: z.string().min(1) },
+			"Add a manual note to an order's internal timeline (attributed to 'Claude (Ops MCP)'). Requires confirm:true.",
+			{ id: z.number().int(), content: z.string().min(1), confirm: z.literal(true) },
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
 			async ({ id, content }) => {
 				const r = await wp(env, `/orders/${id}/notes`, {
 					method: "POST",
@@ -170,6 +213,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"mc_orders_activity",
 			"Recent cross-order activity feed: status changes, payments, notes, and notification sends.",
 			{ limit: z.number().int().min(1).max(100).optional() },
+			{ readOnlyHint: true, openWorldHint: true },
 			async ({ limit }) => {
 				const r = await wp(env, `/orders-activity${qs({ limit })}`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -181,6 +225,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"mc_invoices_list_for_order",
 			"List every invoice raised against a given order.",
 			{ order_id: z.number().int() },
+			{ readOnlyHint: true, openWorldHint: true },
 			async ({ order_id }) => {
 				const r = await wp(env, `/orders/${order_id}/invoices`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -189,7 +234,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"mc_invoice_create",
-			"Create a new invoice against an order.",
+			"Create a new invoice against an order. Requires confirm:true.",
 			{
 				order_id: z.number().int(),
 				amount: z.number().positive(),
@@ -198,7 +243,9 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 				line_items: z
 					.array(z.object({ label: z.string(), amount: z.number() }))
 					.optional(),
+				confirm: z.literal(true),
 			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
 			async ({ order_id, amount, gateway, description, line_items }) => {
 				const r = await wp(env, `/orders/${order_id}/invoices`, {
 					method: "POST",
@@ -212,6 +259,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"mc_invoice_get",
 			"Get a single invoice by its row ID.",
 			{ id: z.number().int() },
+			{ readOnlyHint: true, openWorldHint: true },
 			async ({ id }) => {
 				const r = await wp(env, `/invoices/${id}`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -220,14 +268,16 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"mc_invoice_update",
-			"Update an invoice's status, description, or gateway.",
+			"Update an invoice's status, description, or gateway. Requires confirm:true.",
 			{
 				id: z.number().int(),
 				status: z.string().optional(),
 				description: z.string().optional(),
 				gateway: z.string().optional(),
+				confirm: z.literal(true),
 			},
-			async ({ id, ...fields }) => {
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+			async ({ id, confirm, ...fields }) => {
 				const r = await wp(env, `/invoices/${id}`, { method: "POST", body: fields });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
 			}
@@ -235,13 +285,15 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"mc_invoice_mark_paid",
-			"Mark an invoice as paid — mirrors what happens when a payment gateway webhook confirms payment (same code path, so any paid-invoice notifications still fire).",
+			"Mark an invoice as paid — mirrors what happens when a payment gateway webhook confirms payment (same code path, so any paid-invoice notifications still fire). Requires confirm:true.",
 			{
 				id: z.number().int(),
 				amount: z.number().optional().describe("Amount actually received; defaults to the invoice's full amount"),
 				gateway_payment_id: z.string().optional(),
 				method: z.string().optional(),
+				confirm: z.literal(true),
 			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
 			async ({ id, amount, gateway_payment_id, method }) => {
 				const r = await wp(env, `/invoices/${id}/mark-paid`, {
 					method: "POST",
@@ -264,6 +316,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 				page: z.number().int().min(1).optional(),
 				per_page: z.number().int().min(1).max(100).optional(),
 			},
+			{ readOnlyHint: true, openWorldHint: true },
 			async (args) => {
 				const r = await wp(env, `/contacts${qs(args)}`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -274,6 +327,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"mc_contact_get",
 			"Get full detail for a contact, including notes and linked orders/leads/conversations.",
 			{ id: z.number().int() },
+			{ readOnlyHint: true, openWorldHint: true },
 			async ({ id }) => {
 				const r = await wp(env, `/contacts/${id}`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -282,7 +336,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"mc_contact_update",
-			"Update a contact's name, country, lead_status, marketing consent, or tags.",
+			"Update a contact's name, country, lead_status, marketing consent, or tags. Requires confirm:true.",
 			{
 				id: z.number().int(),
 				name: z.string().optional(),
@@ -290,8 +344,10 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 				lead_status: z.string().optional(),
 				marketing_consent: z.boolean().optional(),
 				tags: z.array(z.string()).optional(),
+				confirm: z.literal(true),
 			},
-			async ({ id, ...fields }) => {
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+			async ({ id, confirm, ...fields }) => {
 				const r = await wp(env, `/contacts/${id}`, { method: "POST", body: fields });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
 			}
@@ -299,8 +355,9 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"mc_contact_add_note",
-			"Add a note to a contact's timeline (attributed to 'Claude (Ops MCP)').",
-			{ id: z.number().int(), body: z.string().min(1) },
+			"Add a note to a contact's timeline (attributed to 'Claude (Ops MCP)'). Requires confirm:true.",
+			{ id: z.number().int(), body: z.string().min(1), confirm: z.literal(true) },
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
 			async ({ id, body }) => {
 				const r = await wp(env, `/contacts/${id}/notes`, { method: "POST", body: { body } });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -311,6 +368,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"mc_contacts_stats",
 			"Dashboard-style aggregate stats for the contacts CRM (totals by country, lead status, etc.).",
 			{},
+			{ readOnlyHint: true, openWorldHint: true },
 			async () => {
 				const r = await wp(env, `/contacts-stats`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -327,6 +385,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 				page: z.number().int().min(1).optional(),
 				per_page: z.number().int().min(1).max(100).optional(),
 			},
+			{ readOnlyHint: true, openWorldHint: true },
 			async ({ status, search, page, per_page }) => {
 				const r = await wp(env, `/leads${qs({ status, search, page, per_page })}`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -337,6 +396,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"mc_lead_get",
 			"Get a single lead by its row ID.",
 			{ id: z.number().int() },
+			{ readOnlyHint: true, openWorldHint: true },
 			async ({ id }) => {
 				const r = await wp(env, `/leads/${id}`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -345,7 +405,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"mc_lead_update",
-			"Update a lead's status or contact details.",
+			"Update a lead's status or contact details. Requires confirm:true.",
 			{
 				id: z.number().int(),
 				status: z.string().optional(),
@@ -353,8 +413,10 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 				email: z.string().optional(),
 				phone: z.string().optional(),
 				notes: z.string().optional(),
+				confirm: z.literal(true),
 			},
-			async ({ id, ...fields }) => {
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+			async ({ id, confirm, ...fields }) => {
 				const r = await wp(env, `/leads/${id}`, { method: "POST", body: fields });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
 			}
@@ -362,8 +424,9 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"mc_leads_delete",
-			"Permanently delete one or more leads by ID. This cannot be undone — confirm with the user before calling this for anything other than obvious spam/test entries.",
-			{ ids: z.array(z.number().int()).min(1) },
+			"Permanently delete one or more leads by ID. This cannot be undone — confirm with the user before calling this for anything other than obvious spam/test entries. Requires confirm:true.",
+			{ ids: z.array(z.number().int()).min(1), confirm: z.literal(true) },
+			{ readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
 			async ({ ids }) => {
 				const r = await wp(env, `/leads/delete`, { method: "POST", body: { ids } });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -380,6 +443,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 				page: z.number().int().min(1).optional(),
 				per_page: z.number().int().min(1).max(100).optional(),
 			},
+			{ readOnlyHint: true, openWorldHint: true },
 			async ({ status, search, page, per_page }) => {
 				const r = await wp(env, `/chat/conversations${qs({ status, search, page, per_page })}`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -390,6 +454,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"mc_chat_conversation_get",
 			"Get a single chat conversation, including its full message history.",
 			{ id: z.number().int() },
+			{ readOnlyHint: true, openWorldHint: true },
 			async ({ id }) => {
 				const r = await wp(env, `/chat/conversations/${id}`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -398,13 +463,15 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"mc_chat_conversation_update",
-			"Update a chat conversation's status (e.g. open/closed) or reassign it to a different agent user ID.",
+			"Update a chat conversation's status (e.g. open/closed) or reassign it to a different agent user ID. Requires confirm:true.",
 			{
 				id: z.number().int(),
 				status: z.string().optional(),
 				assigned_agent_id: z.number().int().optional(),
+				confirm: z.literal(true),
 			},
-			async ({ id, ...fields }) => {
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+			async ({ id, confirm, ...fields }) => {
 				const r = await wp(env, `/chat/conversations/${id}`, { method: "POST", body: fields });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
 			}
@@ -414,6 +481,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"mc_chat_messages_get",
 			"Get messages in a chat conversation. Pass since_id to fetch only new messages after a given message ID.",
 			{ conversation_id: z.number().int(), since_id: z.number().int().optional() },
+			{ readOnlyHint: true, openWorldHint: true },
 			async ({ conversation_id, since_id }) => {
 				const r = await wp(
 					env,
@@ -425,8 +493,9 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"mc_chat_message_send",
-			"Send a staff reply into a chat conversation (appears exactly like a reply sent from the admin chat inbox).",
-			{ conversation_id: z.number().int(), body: z.string().min(1) },
+			"Send a staff reply into a chat conversation (appears exactly like a reply sent from the admin chat inbox). Requires confirm:true.",
+			{ conversation_id: z.number().int(), body: z.string().min(1), confirm: z.literal(true) },
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
 			async ({ conversation_id, body }) => {
 				const r = await wp(env, `/chat/conversations/${conversation_id}/messages`, {
 					method: "POST",
@@ -444,6 +513,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"mc_options_get",
 			"Read the current values of the whitelisted WordPress/plugin config options.",
 			{},
+			{ readOnlyHint: true, openWorldHint: true },
 			async () => {
 				const r = await wp(env, `/options`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -452,10 +522,177 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"mc_options_set",
-			"Update one or more whitelisted WordPress/plugin config options. Rejected if any key isn't on the site's whitelist.",
-			{ options: z.record(z.any()).describe("Map of option_name -> new value") },
+			"Update one or more whitelisted WordPress/plugin config options. Rejected if any key isn't on the site's whitelist. Requires confirm:true.",
+			{ options: z.record(z.any()).describe("Map of option_name -> new value"), confirm: z.literal(true) },
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
 			async ({ options }) => {
 				const r = await wp(env, `/options`, { method: "POST", body: options });
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		/* ── Pricing — re-price one package/extra by slug without touching
+		 * the rest of the catalog. Look up slugs and current prices first
+		 * with mc_options_get (keys: mc_packages, mc_extras). ── */
+		this.server.tool(
+			"mc_package_reprice",
+			"Change the price (and optionally the delivery-timeline prices) of one package, found by its slug — every other package and field is left untouched. Get current slugs/prices from mc_options_get's mc_packages value first. Requires confirm:true.",
+			{
+				slug: z.string().min(1).describe("Package slug, e.g. 'basic' (see mc_packages via mc_options_get)"),
+				price: z.number().nonnegative().optional().describe("New base price"),
+				timelines: z
+					.array(z.object({ label: z.string(), free: z.boolean().optional(), price: z.number().nonnegative() }))
+					.optional()
+					.describe("Replaces the package's delivery-timeline price tiers, e.g. [{ label: '5 days', free: true, price: 0 }, { label: '2 days', price: 20 }]"),
+				confirm: z.literal(true),
+			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+			async ({ slug, price, timelines }) => {
+				if (price === undefined && timelines === undefined) {
+					return toolError(400, { message: "Provide price and/or timelines." });
+				}
+				const r = await wp(env, `/packages/reprice`, { method: "POST", body: { slug, price, timelines } });
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		this.server.tool(
+			"mc_extra_reprice",
+			"Change the price of one extra service, found by its slug — every other extra is left untouched. Get current slugs/prices from mc_options_get's mc_extras value first. Requires confirm:true.",
+			{
+				slug: z.string().min(1).describe("Extra slug, e.g. 'priority' (see mc_extras via mc_options_get)"),
+				price: z.number().nonnegative(),
+				confirm: z.literal(true),
+			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+			async ({ slug, price }) => {
+				const r = await wp(env, `/extras/reprice`, { method: "POST", body: { slug, price } });
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		/* ── Coupons — create/update/delete by code, e.g. for a seasonal
+		 * promotion. Only the matching coupon row is touched; the rest of
+		 * the coupon list is left untouched. ── */
+		this.server.tool(
+			"mc_coupon_create",
+			"Create a new discount coupon (e.g. for a seasonal promotion or event). Fails if the code already exists — use mc_coupon_update instead. Requires confirm:true.",
+			{
+				code: z.string().min(1).describe("Coupon code, e.g. 'SUMMER25' (case-insensitive, stored uppercase)"),
+				type: z.enum(["percent", "fixed"]).default("percent"),
+				amount: z.number().positive().describe("Discount amount — a percentage (0-100) if type='percent', or a flat currency amount if type='fixed'"),
+				name: z.string().optional().describe("Display name; defaults to the code"),
+				active: z.boolean().optional().describe("Defaults to true"),
+				auto_apply: z.boolean().optional().describe("Apply automatically at checkout without the customer entering the code"),
+				expires: z.string().optional().describe("Expiry date, YYYY-MM-DD. Leave unset for no expiry."),
+				confirm: z.literal(true),
+			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+			async ({ code, type, amount, name, active, auto_apply, expires }) => {
+				const r = await wp(env, `/coupons`, {
+					method: "POST",
+					body: { code, type, amount, name, active, auto_apply, expires },
+				});
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		this.server.tool(
+			"mc_coupon_update",
+			"Update an existing coupon's amount, type, active state, auto_apply, expiry, or display name, found by its code. Requires confirm:true.",
+			{
+				code: z.string().min(1),
+				type: z.enum(["percent", "fixed"]).optional(),
+				amount: z.number().positive().optional(),
+				name: z.string().optional(),
+				active: z.boolean().optional().describe("Set to false to deactivate a coupon, e.g. once a promotion ends"),
+				auto_apply: z.boolean().optional(),
+				expires: z.string().optional().describe("Expiry date, YYYY-MM-DD"),
+				confirm: z.literal(true),
+			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+			async ({ code, confirm, ...fields }) => {
+				const r = await wp(env, `/coupons/${encodeURIComponent(code)}`, { method: "POST", body: fields });
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		this.server.tool(
+			"mc_coupon_delete",
+			"Permanently remove a coupon by code, e.g. once a seasonal promotion has ended. Requires confirm:true.",
+			{ code: z.string().min(1), confirm: z.literal(true) },
+			{ readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+			async ({ code }) => {
+				const r = await wp(env, `/coupons/${encodeURIComponent(code)}/delete`, { method: "POST" });
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		/* ── FAQs — mc_faqs has no natural unique key (question text can
+		 * repeat), so update/delete address a row by its 0-based position.
+		 * Get the current list/order from mc_options_get's mc_faqs value
+		 * first. ── */
+		this.server.tool(
+			"mc_faq_manage",
+			"Create, update, or delete a FAQ entry. For 'update'/'delete', pass the 0-based index of the FAQ from mc_options_get's mc_faqs value — order can shift if the list changes, so re-check the index if unsure. Requires confirm:true.",
+			{
+				action: z.enum(["create", "update", "delete"]),
+				index: z.number().int().min(0).optional().describe("Required for update/delete — 0-based position in the current mc_faqs list"),
+				category: z.string().optional().describe("e.g. 'General', 'Pricing', 'Delivery'"),
+				question: z.string().optional().describe("Required for create"),
+				answer: z.string().optional().describe("Required for create. HTML is allowed."),
+				active: z.boolean().optional(),
+				confirm: z.literal(true),
+			},
+			{ readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+			async ({ action, index, category, question, answer, active }) => {
+				if (action === "create") {
+					if (!question || !answer) {
+						return toolError(400, { message: "question and answer are required to create a FAQ." });
+					}
+					const r = await wp(env, `/faqs`, { method: "POST", body: { category, question, answer, active } });
+					return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+				}
+				if (index === undefined) {
+					return toolError(400, { message: "index is required for update/delete — get it from mc_options_get's mc_faqs value." });
+				}
+				if (action === "delete") {
+					const r = await wp(env, `/faqs/${index}/delete`, { method: "POST" });
+					return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+				}
+				const r = await wp(env, `/faqs/${index}`, { method: "POST", body: { category, question, answer, active } });
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		/* ── Brands — matched by name (case-insensitive), same pattern as
+		 * coupons' code. ── */
+		this.server.tool(
+			"mc_brand_manage",
+			"Create, update, or delete a client/partner brand logo entry. 'name' identifies the brand (case-insensitive) for update/delete; use new_name to rename one. Requires confirm:true.",
+			{
+				action: z.enum(["create", "update", "delete"]),
+				name: z.string().min(1).describe("Brand name — required always: the new brand's name for create, or the existing brand to match for update/delete"),
+				logo: z.string().optional().describe("Logo image URL"),
+				url: z.string().optional().describe("Brand's website URL"),
+				new_name: z.string().optional().describe("Update only: rename the brand to this"),
+				confirm: z.literal(true),
+			},
+			{ readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+			async ({ action, name, logo, url, new_name }) => {
+				if (action === "create") {
+					const r = await wp(env, `/brands`, { method: "POST", body: { name, logo, url } });
+					return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+				}
+				if (action === "delete") {
+					const r = await wp(env, `/brands/${encodeURIComponent(name)}/delete`, { method: "POST" });
+					return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+				}
+				const body: Record<string, unknown> = {};
+				if (new_name !== undefined) body.name = new_name;
+				if (logo !== undefined) body.logo = logo;
+				if (url !== undefined) body.url = url;
+				const r = await wp(env, `/brands/${encodeURIComponent(name)}`, { method: "POST", body });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
 			}
 		);
@@ -473,6 +710,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 				page: z.number().int().min(1).optional(),
 				per_page: z.number().int().min(1).max(100).optional(),
 			},
+			{ readOnlyHint: true, openWorldHint: true },
 			async ({ status, search, page, per_page }) => {
 				const r = await wp(env, `/posts${qs({ status: status ?? "any", search, page, per_page })}`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -483,6 +721,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"wp_post_get",
 			"Get a single WordPress post by ID (any status), including full content.",
 			{ id: z.number().int() },
+			{ readOnlyHint: true, openWorldHint: true },
 			async ({ id }) => {
 				const r = await wp(env, `/posts/${id}`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -491,7 +730,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"wp_post_create",
-			"Create a WordPress post — draft, publish immediately, or schedule for the future. To schedule, set status='future' and date to a datetime in the site's local timezone, e.g. '2026-07-20 09:00:00'.",
+			"Create a WordPress post — draft, publish immediately, or schedule for the future. To schedule, set status='future' and date to a datetime in the site's local timezone, e.g. '2026-07-20 09:00:00'. Requires confirm:true.",
 			{
 				title: z.string().min(1),
 				content: z.string().min(1).describe("Post body. HTML is allowed."),
@@ -502,7 +741,9 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 				author_id: z.number().int().optional().describe("WP user ID to attribute the post to; defaults to the site's first Administrator"),
 				categories: z.array(z.number().int()).optional().describe("Category term IDs"),
 				tags: z.array(z.number().int()).optional().describe("Tag term IDs"),
+				confirm: z.literal(true),
 			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
 			async ({ title, content, status, date, excerpt, slug, author_id, categories, tags }) => {
 				if (status === "future" && !date) {
 					return toolError(400, { message: "date is required when status='future'" });
@@ -517,7 +758,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"wp_post_update",
-			"Update an existing WordPress post — change content, status, or reschedule (set status='future' + a new date).",
+			"Update an existing WordPress post — change content, status, or reschedule (set status='future' + a new date). Requires confirm:true.",
 			{
 				id: z.number().int(),
 				title: z.string().optional(),
@@ -527,8 +768,10 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 				excerpt: z.string().optional(),
 				categories: z.array(z.number().int()).optional(),
 				tags: z.array(z.number().int()).optional(),
+				confirm: z.literal(true),
 			},
-			async ({ id, ...fields }) => {
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+			async ({ id, confirm, ...fields }) => {
 				const r = await wp(env, `/posts/${id}`, { method: "POST", body: fields });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
 			}
@@ -536,7 +779,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"wp_posts_schedule_batch",
-			"Create multiple scheduled posts in one call — e.g. a week's worth of blog content. Each item needs its own date.",
+			"Create multiple scheduled posts in one call — e.g. a week's worth of blog content. Each item needs its own date. Requires confirm:true.",
 			{
 				posts: z
 					.array(
@@ -551,7 +794,9 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 					)
 					.min(1)
 					.max(50),
+				confirm: z.literal(true),
 			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
 			async ({ posts }) => {
 				const r = await wp(env, `/posts/batch-schedule`, { method: "POST", body: { posts } });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -567,6 +812,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"wp_plugins_list",
 			"List every installed plugin: name, version, whether it's active, and whether an update is available.",
 			{},
+			{ readOnlyHint: true, openWorldHint: true },
 			async () => {
 				const r = await wp(env, `/wp/plugins`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -577,6 +823,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"wp_plugin_activate",
 			"Activate an installed plugin by its file path (e.g. 'akismet/akismet.php', from wp_plugins_list). Requires confirm:true — an incompatible plugin can break the site.",
 			{ file: z.string().min(1), confirm: z.literal(true) },
+			{ readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
 			async ({ file, confirm }) => {
 				const r = await wp(env, `/wp/plugins/activate`, { method: "POST", body: { file, confirm } });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -587,6 +834,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"wp_plugin_deactivate",
 			"Deactivate a plugin by its file path. This is the usual first fix if activating/updating a plugin broke the site. Requires confirm:true.",
 			{ file: z.string().min(1), confirm: z.literal(true) },
+			{ readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
 			async ({ file, confirm }) => {
 				const r = await wp(env, `/wp/plugins/deactivate`, { method: "POST", body: { file, confirm } });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -605,6 +853,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"wp_updates_check",
 			"Check for available WordPress core, plugin, and theme updates. Read-only — safe to call any time.",
 			{},
+			{ readOnlyHint: true, openWorldHint: true },
 			async () => {
 				const r = await wp(env, `/wp/updates`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -615,6 +864,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"wp_plugin_update",
 			"Update a single plugin to its latest version. Requires confirm:true. Not trivially reversible on shared hosting (no automatic rollback) — worth checking the plugin's changelog for breaking changes first.",
 			{ file: z.string().min(1), confirm: z.literal(true) },
+			{ readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
 			async ({ file, confirm }) => {
 				const r = await wp(env, `/wp/updates/plugin`, { method: "POST", body: { file, confirm } });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -625,6 +875,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"wp_theme_update",
 			"Update a theme to its latest version. Requires confirm:true. Not trivially reversible on shared hosting — check for child-theme/override conflicts first.",
 			{ stylesheet: z.string().min(1).describe("Theme stylesheet slug, e.g. 'astra'"), confirm: z.literal(true) },
+			{ readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
 			async ({ stylesheet, confirm }) => {
 				const r = await wp(env, `/wp/updates/theme`, { method: "POST", body: { stylesheet, confirm } });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -635,6 +886,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"wp_core_update",
 			"Update WordPress core to the latest available version. HIGH RISK — this is the hardest of the update tools to reverse on this host. Requires confirm:true. Always confirm a recent site backup exists before calling this, and prefer running it manually from wp-admin unless there's a specific reason to do it here.",
 			{ confirm: z.literal(true) },
+			{ readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
 			async ({ confirm }) => {
 				const r = await wp(env, `/wp/updates/core`, { method: "POST", body: { confirm } });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
@@ -643,7 +895,10 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		/* ── Read-only database query ────────────────────────────────────
 		 * SELECT / SHOW / DESCRIBE / EXPLAIN only — enforced on the
-		 * WordPress side (minicad-ops-bridge.php), not just here. Use this
+		 * WordPress side (minicad-ops-bridge.php), not just here. wp_users,
+		 * wp_usermeta, and wp_options are additionally blocked there (see
+		 * that file) so this ad-hoc tool can't be used to read password
+		 * hashes or option values excluded from mc_options_get/set. Use this
 		 * for ad-hoc reporting questions that the structured tools above
 		 * don't cover directly. It deliberately cannot write — every write
 		 * in this server goes through the structured routes above so the
@@ -651,11 +906,12 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 		 */
 		this.server.tool(
 			"wp_db_query",
-			"Run a read-only SQL query against the WordPress database (SELECT / SHOW / DESCRIBE / EXPLAIN only — writes are rejected). Useful for ad-hoc reporting that the structured tools don't cover. Table names use the site's actual prefix (commonly 'wp_') — check with `SHOW TABLES` if unsure. A LIMIT is added automatically if you don't include one.",
+			"Run a read-only SQL query against the WordPress database (SELECT / SHOW / DESCRIBE / EXPLAIN only — writes are rejected). Cannot query wp_users, wp_usermeta, or wp_options directly — use mc_options_get/mc_options_set for whitelisted settings instead. Useful for ad-hoc reporting that the structured tools don't cover. Table names use the site's actual prefix (commonly 'wp_') — check with `SHOW TABLES` if unsure. A LIMIT is added automatically if you don't include one.",
 			{
 				sql: z.string().min(1),
 				limit: z.number().int().min(1).max(500).optional().describe("Max rows to return if the query has no explicit LIMIT (default 100, max 500)"),
 			},
+			{ readOnlyHint: true, openWorldHint: true },
 			async ({ sql, limit }) => {
 				const r = await wp(env, `/db/query`, { method: "POST", body: { sql, limit } });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
