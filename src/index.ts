@@ -121,9 +121,15 @@ const seoMetaSchema = z
 		rank_math_focus_keyword: z.string().optional(),
 		rank_math_canonical_url: z.string().optional(),
 		rank_math_robots: z.string().optional(),
+		rank_math_facebook_title: z.string().optional(),
+		rank_math_facebook_description: z.string().optional(),
+		rank_math_twitter_title: z.string().optional(),
+		rank_math_twitter_description: z.string().optional(),
 	})
 	.strict()
-	.describe("Whitelisted Rank Math SEO fields to set on this post. Only these five keys are accepted.");
+	.describe(
+		"Whitelisted Rank Math SEO fields to set on this post. Only these nine keys are accepted — rank_math_seo_score is NOT settable here (it's Rank Math's own computed score, returned read-only by wp_post_get)."
+	);
 
 const qs = (params: Record<string, string | number | undefined>) => {
 	const usp = new URLSearchParams();
@@ -717,23 +723,24 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 		 * Passwords), consistent with every other tool in this server. ── */
 		this.server.tool(
 			"wp_posts_list",
-			"List WordPress posts (any status) with optional search.",
+			"List WordPress content (any status) with optional search. Defaults to blog posts — pass post_type to list pages, services, or portfolio items instead, e.g. for a site-wide SEO audit across all content types.",
 			{
+				post_type: z.enum(["post", "page", "mc_service", "mc_portfolio", "any"]).optional().describe("Defaults to 'post'. 'mc_service' = Services entries, 'mc_portfolio' = Portfolio entries, 'any' = everything."),
 				status: z.enum(["publish", "future", "draft", "pending", "private", "any"]).optional(),
 				search: z.string().optional(),
 				page: z.number().int().min(1).optional(),
 				per_page: z.number().int().min(1).max(100).optional(),
 			},
 			{ readOnlyHint: true, openWorldHint: true },
-			async ({ status, search, page, per_page }) => {
-				const r = await wp(env, `/posts${qs({ status: status ?? "any", search, page, per_page })}`);
+			async ({ post_type, status, search, page, per_page }) => {
+				const r = await wp(env, `/posts${qs({ post_type, status: status ?? "any", search, page, per_page })}`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
 			}
 		);
 
 		this.server.tool(
 			"wp_post_get",
-			"Get a single WordPress post by ID (any status), including full content and its whitelisted Rank Math SEO meta (rank_math_title, rank_math_description, etc.).",
+			"Get a single WordPress post/page/service/portfolio item by ID (any status), including full content and its Rank Math SEO meta (title, description, focus keyword, canonical URL, robots, social title/description, and the read-only rank_math_seo_score).",
 			{ id: z.number().int() },
 			{ readOnlyHint: true, openWorldHint: true },
 			async ({ id }) => {
