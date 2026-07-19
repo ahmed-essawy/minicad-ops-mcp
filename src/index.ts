@@ -111,6 +111,26 @@ function toolError(status: number, data: unknown) {
 	};
 }
 
+// Whitelisted Rank Math SEO post-meta fields — must mirror
+// mc_ops_bridge_meta_whitelist() in minicad-ops-bridge.php. Any other key
+// sent here is rejected server-side before anything is written.
+const seoMetaSchema = z
+	.object({
+		rank_math_title: z.string().optional(),
+		rank_math_description: z.string().optional(),
+		rank_math_focus_keyword: z.string().optional(),
+		rank_math_canonical_url: z.string().optional(),
+		rank_math_robots: z.string().optional(),
+		rank_math_facebook_title: z.string().optional(),
+		rank_math_facebook_description: z.string().optional(),
+		rank_math_twitter_title: z.string().optional(),
+		rank_math_twitter_description: z.string().optional(),
+	})
+	.strict()
+	.describe(
+		"Whitelisted Rank Math SEO fields to set on this post. Only these nine keys are accepted — rank_math_seo_score is NOT settable here (it's Rank Math's own computed score, returned read-only by wp_post_get)."
+	);
+
 const qs = (params: Record<string, string | number | undefined>) => {
 	const usp = new URLSearchParams();
 	for (const [k, v] of Object.entries(params)) {
@@ -703,23 +723,24 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 		 * Passwords), consistent with every other tool in this server. ── */
 		this.server.tool(
 			"wp_posts_list",
-			"List WordPress posts (any status) with optional search.",
+			"List WordPress content (any status) with optional search. Defaults to blog posts — pass post_type to list pages, services, or portfolio items instead, e.g. for a site-wide SEO audit across all content types.",
 			{
+				post_type: z.enum(["post", "page", "mc_service", "mc_portfolio", "any"]).optional().describe("Defaults to 'post'. 'mc_service' = Services entries, 'mc_portfolio' = Portfolio entries, 'any' = everything."),
 				status: z.enum(["publish", "future", "draft", "pending", "private", "any"]).optional(),
 				search: z.string().optional(),
 				page: z.number().int().min(1).optional(),
 				per_page: z.number().int().min(1).max(100).optional(),
 			},
 			{ readOnlyHint: true, openWorldHint: true },
-			async ({ status, search, page, per_page }) => {
-				const r = await wp(env, `/posts${qs({ status: status ?? "any", search, page, per_page })}`);
+			async ({ post_type, status, search, page, per_page }) => {
+				const r = await wp(env, `/posts${qs({ post_type, status: status ?? "any", search, page, per_page })}`);
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
 			}
 		);
 
 		this.server.tool(
 			"wp_post_get",
-			"Get a single WordPress post by ID (any status), including full content.",
+			"Get a single WordPress post/page/service/portfolio item by ID (any status), including full content and its Rank Math SEO meta (title, description, focus keyword, canonical URL, robots, social title/description, and the read-only rank_math_seo_score).",
 			{ id: z.number().int() },
 			{ readOnlyHint: true, openWorldHint: true },
 			async ({ id }) => {
@@ -758,7 +779,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"wp_post_update",
-			"Update an existing WordPress post — change content, status, or reschedule (set status='future' + a new date). Requires confirm:true.",
+			"Update an existing WordPress post — change content, status, reschedule (set status='future' + a new date), or set whitelisted Rank Math SEO meta. Requires confirm:true.",
 			{
 				id: z.number().int(),
 				title: z.string().optional(),
@@ -768,6 +789,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 				excerpt: z.string().optional(),
 				categories: z.array(z.number().int()).optional(),
 				tags: z.array(z.number().int()).optional(),
+				meta: seoMetaSchema.optional(),
 				confirm: z.literal(true),
 			},
 			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
@@ -799,6 +821,35 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			{ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
 			async ({ posts }) => {
 				const r = await wp(env, `/posts/batch-schedule`, { method: "POST", body: { posts } });
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		this.server.tool(
+			"wp_posts_batch_update",
+			"Update up to 50 existing WordPress posts in one call — e.g. fixing an outdated price mentioned across many blog posts, or setting SEO meta on several pages at once. Each item is applied independently: one bad post (not found, invalid status, non-whitelisted meta key) doesn't block the rest — check each result's ok field. Requires confirm:true.",
+			{
+				posts: z
+					.array(
+						z.object({
+							id: z.number().int().describe("Post ID to update"),
+							title: z.string().optional(),
+							content: z.string().optional().describe("Full replacement post body (HTML allowed). Fetch the current content with wp_post_get first if you're patching specific text within it."),
+							excerpt: z.string().optional(),
+							status: z.enum(["draft", "publish", "future", "pending", "trash"]).optional(),
+							date: z.string().optional().describe("Site-local time, e.g. '2026-07-20 09:00:00'"),
+							categories: z.array(z.number().int()).optional(),
+							tags: z.array(z.number().int()).optional(),
+							meta: seoMetaSchema.optional(),
+						})
+					)
+					.min(1)
+					.max(50),
+				confirm: z.literal(true),
+			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+			async ({ posts }) => {
+				const r = await wp(env, `/posts/batch-update`, { method: "POST", body: { posts } });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
 			}
 		);
