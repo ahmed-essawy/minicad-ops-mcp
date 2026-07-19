@@ -111,6 +111,20 @@ function toolError(status: number, data: unknown) {
 	};
 }
 
+// Whitelisted Rank Math SEO post-meta fields — must mirror
+// mc_ops_bridge_meta_whitelist() in minicad-ops-bridge.php. Any other key
+// sent here is rejected server-side before anything is written.
+const seoMetaSchema = z
+	.object({
+		rank_math_title: z.string().optional(),
+		rank_math_description: z.string().optional(),
+		rank_math_focus_keyword: z.string().optional(),
+		rank_math_canonical_url: z.string().optional(),
+		rank_math_robots: z.string().optional(),
+	})
+	.strict()
+	.describe("Whitelisted Rank Math SEO fields to set on this post. Only these five keys are accepted.");
+
 const qs = (params: Record<string, string | number | undefined>) => {
 	const usp = new URLSearchParams();
 	for (const [k, v] of Object.entries(params)) {
@@ -719,7 +733,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"wp_post_get",
-			"Get a single WordPress post by ID (any status), including full content.",
+			"Get a single WordPress post by ID (any status), including full content and its whitelisted Rank Math SEO meta (rank_math_title, rank_math_description, etc.).",
 			{ id: z.number().int() },
 			{ readOnlyHint: true, openWorldHint: true },
 			async ({ id }) => {
@@ -758,7 +772,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 
 		this.server.tool(
 			"wp_post_update",
-			"Update an existing WordPress post — change content, status, or reschedule (set status='future' + a new date). Requires confirm:true.",
+			"Update an existing WordPress post — change content, status, reschedule (set status='future' + a new date), or set whitelisted Rank Math SEO meta. Requires confirm:true.",
 			{
 				id: z.number().int(),
 				title: z.string().optional(),
@@ -768,6 +782,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 				excerpt: z.string().optional(),
 				categories: z.array(z.number().int()).optional(),
 				tags: z.array(z.number().int()).optional(),
+				meta: seoMetaSchema.optional(),
 				confirm: z.literal(true),
 			},
 			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
@@ -799,6 +814,35 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			{ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
 			async ({ posts }) => {
 				const r = await wp(env, `/posts/batch-schedule`, { method: "POST", body: { posts } });
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		this.server.tool(
+			"wp_posts_batch_update",
+			"Update up to 50 existing WordPress posts in one call — e.g. fixing an outdated price mentioned across many blog posts, or setting SEO meta on several pages at once. Each item is applied independently: one bad post (not found, invalid status, non-whitelisted meta key) doesn't block the rest — check each result's ok field. Requires confirm:true.",
+			{
+				posts: z
+					.array(
+						z.object({
+							id: z.number().int().describe("Post ID to update"),
+							title: z.string().optional(),
+							content: z.string().optional().describe("Full replacement post body (HTML allowed). Fetch the current content with wp_post_get first if you're patching specific text within it."),
+							excerpt: z.string().optional(),
+							status: z.enum(["draft", "publish", "future", "pending", "trash"]).optional(),
+							date: z.string().optional().describe("Site-local time, e.g. '2026-07-20 09:00:00'"),
+							categories: z.array(z.number().int()).optional(),
+							tags: z.array(z.number().int()).optional(),
+							meta: seoMetaSchema.optional(),
+						})
+					)
+					.min(1)
+					.max(50),
+				confirm: z.literal(true),
+			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+			async ({ posts }) => {
+				const r = await wp(env, `/posts/batch-update`, { method: "POST", body: { posts } });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
 			}
 		);
