@@ -847,7 +847,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 					.max(50),
 				confirm: z.literal(true),
 			},
-			{ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
 			async ({ posts }) => {
 				const r = await wp(env, `/posts/batch-update`, { method: "POST", body: { posts } });
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
