@@ -854,6 +854,36 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			}
 		);
 
+		/* ── Mail — sends via the WordPress site's own wp_mail(), which
+		 * transparently routes through FluentSMTP (active on this site) or
+		 * falls back to PHP's native mail() if no SMTP plugin is active.
+		 * The From identity is always the site's own configured sender —
+		 * this can't be used to spoof an arbitrary From address. ── */
+		this.server.tool(
+			"mc_mail_send",
+			"Send an email through the site's configured mail sender (FluentSMTP, or WordPress's native mail() if that's ever deactivated) — always from the business's own configured address, never a caller-supplied From. For one-off correspondence with a client or lead outside the automated order/chat notification flows. Max 10 recipients combined across to/cc/bcc — not for bulk mail. Requires confirm:true (checked server-side too) since a sent email can't be unsent.",
+			{
+				to: z.array(z.string().email()).min(1).describe("Recipient email address(es)"),
+				subject: z.string().min(1),
+				body: z.string().min(1).describe("Email body. HTML by default — see is_html."),
+				is_html: z.boolean().optional().describe("Defaults to true. Set false to send as plain text."),
+				cc: z.array(z.string().email()).optional(),
+				bcc: z.array(z.string().email()).optional(),
+				reply_to: z.string().email().optional(),
+				order_id: z.number().int().optional().describe("If given, logs a note on this order that the email was sent"),
+				contact_id: z.number().int().optional().describe("If given, logs a note on this contact that the email was sent"),
+				confirm: z.literal(true),
+			},
+			{ readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+			async ({ to, subject, body, is_html, cc, bcc, reply_to, order_id, contact_id, confirm }) => {
+				const r = await wp(env, `/mail/send`, {
+					method: "POST",
+					body: { to, subject, body, is_html, cc, bcc, reply_to, order_id, contact_id, confirm },
+				});
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
 		/* ── WordPress plugin management ────────────────────────────────
 		 * Activate/deactivate use a "confirm: true" speed bump since a bad
 		 * activation can white-screen the site. Deactivating a plugin is the
