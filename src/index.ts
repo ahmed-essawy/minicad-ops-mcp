@@ -863,7 +863,7 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			"mc_mail_send",
 			"Send an email through the site's configured mail sender (FluentSMTP, or WordPress's native mail() if that's ever deactivated) — always from the business's own configured address, never a caller-supplied From. For one-off correspondence with a client or lead outside the automated order/chat notification flows. Max 10 recipients combined across to/cc/bcc — not for bulk mail. Requires confirm:true (checked server-side too) since a sent email can't be unsent.",
 			{
-				to: z.array(z.string().email()).min(1).max(10).describe("Recipient email address(es)"),
+				to: z.array(z.string().email()).min(1).describe("Recipient email address(es)"),
 				subject: z.string().min(1),
 				body: z.string().min(1).describe("Email body. HTML by default — see is_html."),
 				is_html: z.boolean().optional().describe("Defaults to true. Set false to send as plain text."),
