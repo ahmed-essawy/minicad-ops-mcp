@@ -15,5 +15,7 @@
 		{ "tag": "v1", "new_sqlite_classes": ["MiniCadOpsMCP"] }
 	],
 
-	"vars": {}
+	"vars": {
+		"WP_BASE_URL": "https://minicad.io"
+	}
 }
