@@ -30,8 +30,12 @@ export interface Env {
 const WP_FETCH_TIMEOUT_MS = 20_000;
 // Imagen generation + server-side re-encoding routinely runs well past the
 // default timeout above — give mc_ai_image_create its own, longer budget
-// rather than aborting a request that was actually still succeeding.
-const AI_IMAGE_TIMEOUT_MS = 90_000;
+// rather than aborting a request that was actually still succeeding. Set
+// deliberately higher than WP's own ~90s Imagen call + ~150s script time
+// limit (see minicad-ops-bridge.php) so this is the outermost clock: if
+// anything times out, it's WP's own bounds firing first with a clean error,
+// not this Worker severing a connection WP was still successfully using.
+const AI_IMAGE_TIMEOUT_MS = 170_000;
 
 /* ── WordPress REST helper ──────────────────────────────────────────
  * Calls the MiniCAD Ops Bridge plugin's custom routes (minicad-ops/v1/...)
