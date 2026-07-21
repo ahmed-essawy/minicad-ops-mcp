@@ -28,6 +28,14 @@ export interface Env {
 // the signal a well-behaved client can use to decide that on its own.
 
 const WP_FETCH_TIMEOUT_MS = 20_000;
+// Imagen generation + server-side re-encoding routinely runs well past the
+// default timeout above — give mc_ai_image_create its own, longer budget
+// rather than aborting a request that was actually still succeeding. Set
+// deliberately higher than WP's own ~90s Imagen call + ~150s script time
+// limit (see minicad-ops-bridge.php) so this is the outermost clock: if
+// anything times out, it's WP's own bounds firing first with a clean error,
+// not this Worker severing a connection WP was still successfully using.
+const AI_IMAGE_TIMEOUT_MS = 170_000;
 
 /* ── WordPress REST helper ──────────────────────────────────────────
  * Calls the MiniCAD Ops Bridge plugin's custom routes (minicad-ops/v1/...)
@@ -40,13 +48,14 @@ const WP_FETCH_TIMEOUT_MS = 20_000;
 async function wp(
 	env: Env,
 	path: string,
-	init: { method?: string; body?: unknown } = {}
+	init: { method?: string; body?: unknown; timeoutMs?: number } = {}
 ): Promise<{ ok: boolean; status: number; data: unknown }> {
 	const base = env.WP_BASE_URL.replace(/\/+$/, "");
 	const url = `${base}/wp-json/minicad-ops/v1${path}`;
+	const timeoutMs = init.timeoutMs ?? WP_FETCH_TIMEOUT_MS;
 
 	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), WP_FETCH_TIMEOUT_MS);
+	const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
 	let res: Response;
 	try {
@@ -63,7 +72,7 @@ async function wp(
 	} catch (err) {
 		const message =
 			err instanceof Error && err.name === "AbortError"
-				? `Request to WordPress timed out after ${WP_FETCH_TIMEOUT_MS / 1000}s (${path}).`
+				? `Request to WordPress timed out after ${timeoutMs / 1000}s (${path}).`
 				: `Could not reach WordPress at ${path}: ${err instanceof Error ? err.message : String(err)}`;
 		return { ok: false, status: 0, data: { message } };
 	} finally {
@@ -879,6 +888,33 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 				const r = await wp(env, `/mail/send`, {
 					method: "POST",
 					body: { to, subject, body, is_html, cc, bcc, reply_to, order_id, contact_id, confirm },
+				});
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		/* ── AI image generation — Google Imagen 4, added to the media
+		 * library server-side (downscaled + recompressed as JPEG). The
+		 * Imagen API key lives only in the WordPress server's own
+		 * environment (GEMINI_API_KEY) — never passed through this tool. ── */
+		this.server.tool(
+			"mc_ai_image_create",
+			"Generate a photorealistic image with Google Imagen 4 and add it to the WordPress media library (auto-downscaled to a max 1600px edge, recompressed as JPEG for PageSpeed). Optionally attaches it to a post and/or sets it as that post's featured image. Returns the attachment ID and public minicad.io URL for embedding in post HTML. On a content-policy refusal or API error, returns a clear error string — fall back to a stock photo (e.g. Pexels) for that slot rather than retrying blindly. Costs ~$0.04/image. Requires confirm:true.",
+			{
+				prompt: z.string().min(1).describe("Photorealistic scene description for Imagen"),
+				filename: z.string().min(1).describe("Slug base for the file, no extension, e.g. 'cad-design-pricing-1'"),
+				alt_text: z.string().min(1).describe("Keyword-rich alt text for accessibility/SEO"),
+				aspect_ratio: z.enum(["16:9", "4:3", "1:1", "3:4", "9:16"]).default("16:9"),
+				post_id: z.number().int().optional().describe("Attach the generated attachment to this post"),
+				set_as_featured: z.boolean().optional().describe("Set this image as post_id's featured image. Requires post_id. Defaults to false."),
+				confirm: z.literal(true),
+			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+			async ({ prompt, filename, alt_text, aspect_ratio, post_id, set_as_featured, confirm }) => {
+				const r = await wp(env, `/media/ai-image`, {
+					method: "POST",
+					body: { prompt, filename, alt_text, aspect_ratio, post_id, set_as_featured, confirm },
+					timeoutMs: AI_IMAGE_TIMEOUT_MS,
 				});
 				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
 			}
