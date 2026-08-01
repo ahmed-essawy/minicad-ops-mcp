@@ -867,6 +867,32 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			}
 		);
 
+		/* ── Content replace — literal find/replace across post/page content
+		 * (e.g. swapping a URL site-wide). dry_run:true previews counts with
+		 * no confirm needed; a real write requires confirm:true. Capped
+		 * server-side at 200 matched posts per call. ── */
+		this.server.tool(
+			"mc_content_replace",
+			"Literal find/replace of a substring across post/page content (e.g. swap a URL site-wide). ALWAYS call with dry_run:true first to preview which posts and how many occurrences would change — nothing is written in a dry run and confirm isn't needed. Once the preview looks right, re-run with dry_run:false and confirm:true to apply. Goes through wp_update_post so hooks/cache-clearing fire. Capped at 200 matched posts per call — narrow post_types/post_statuses or split the search if you hit that cap.",
+			{
+				search: z.string().min(1).describe("Exact literal substring to find (not a regex)"),
+				replace: z.string().describe("Replacement text — can be empty to remove the matched text"),
+				post_types: z.array(z.string()).optional().describe("Defaults to ['post']"),
+				post_statuses: z.array(z.string()).optional().describe("Defaults to publish/future/draft/pending/private"),
+				include_ids: z.array(z.number().int()).optional().describe("Extra specific post/page IDs to include regardless of post_type/post_status, e.g. a page outside the default type filter"),
+				dry_run: z.boolean().optional().describe("Preview only — no writes, no confirm needed. Defaults to false."),
+				confirm: z.literal(true).optional().describe("Required when dry_run is not true"),
+			},
+			{ readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+			async ({ search, replace, post_types, post_statuses, include_ids, dry_run, confirm }) => {
+				const r = await wp(env, `/content/replace`, {
+					method: "POST",
+					body: { search, replace, post_types, post_statuses, include_ids, dry_run, confirm },
+				});
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
 		/* ── Mail — sends via the WordPress site's own wp_mail(), which
 		 * transparently routes through FluentSMTP (active on this site) or
 		 * falls back to PHP's native mail() if no SMTP plugin is active.
