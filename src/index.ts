@@ -33,13 +33,15 @@ const WP_FETCH_TIMEOUT_MS = 20_000;
 // the default WP_FETCH_TIMEOUT_MS, so this needs its own longer budget too.
 const MEDIA_SIDELOAD_TIMEOUT_MS = 60_000;
 // mc_ai_image_create holds the request open through a Rendobar job
-// create (30s) + poll (hard-capped at 60s, see mc_ops_bridge_rendobar_wait_job
-// in minicad-ops-bridge.php) + sideload (30s download + thumbnail generation)
-// round trip — set with real margin above that ~120s+ PHP-side worst case so
-// this is the outermost clock: if anything times out, it's WP's own bound
-// firing first with a clean error, not this Worker severing a connection WP
-// was still successfully using.
-const AI_IMAGE_TIMEOUT_MS = 160_000;
+// create (up to 2 attempts x 30s + 3s backoff = ~63s worst case, retried
+// only on a transient network/5xx failure — see
+// mc_ops_bridge_rendobar_create_job) + poll (hard-capped at 110s, see
+// mc_ops_bridge_rendobar_wait_job) + sideload (30s download + thumbnail
+// generation) round trip — set with real margin above that ~220s+ PHP-side
+// worst case so this is the outermost clock: if anything times out, it's
+// WP's own bound firing first with a clean error, not this Worker severing
+// a connection WP was still successfully using.
+const AI_IMAGE_TIMEOUT_MS = 280_000;
 
 /* ── WordPress REST helper ──────────────────────────────────────────
  * Calls the MiniCAD Ops Bridge plugin's custom routes (minicad-ops/v1/...)
