@@ -28,14 +28,18 @@ export interface Env {
 // the signal a well-behaved client can use to decide that on its own.
 
 const WP_FETCH_TIMEOUT_MS = 20_000;
-// Imagen generation + server-side re-encoding routinely runs well past the
-// default timeout above — give mc_ai_image_create its own, longer budget
-// rather than aborting a request that was actually still succeeding. Set
-// deliberately higher than WP's own ~90s Imagen call + ~150s script time
-// limit (see minicad-ops-bridge.php) so this is the outermost clock: if
-// anything times out, it's WP's own bounds firing first with a clean error,
-// not this Worker severing a connection WP was still successfully using.
-const AI_IMAGE_TIMEOUT_MS = 170_000;
+// mc_media_sideload's PHP side (mc_ops_bridge_sideload_url) has its own 30s
+// download_url() timeout plus thumbnail-generation time — comfortably above
+// the default WP_FETCH_TIMEOUT_MS, so this needs its own longer budget too.
+const MEDIA_SIDELOAD_TIMEOUT_MS = 60_000;
+// mc_ai_image_create holds the request open through a Rendobar job
+// create (30s) + poll (hard-capped at 60s, see mc_ops_bridge_rendobar_wait_job
+// in minicad-ops-bridge.php) + sideload (30s download + thumbnail generation)
+// round trip — set with real margin above that ~120s+ PHP-side worst case so
+// this is the outermost clock: if anything times out, it's WP's own bound
+// firing first with a clean error, not this Worker severing a connection WP
+// was still successfully using.
+const AI_IMAGE_TIMEOUT_MS = 160_000;
 
 /* ── WordPress REST helper ──────────────────────────────────────────
  * Calls the MiniCAD Ops Bridge plugin's custom routes (minicad-ops/v1/...)
@@ -893,15 +897,42 @@ export class MiniCadOpsMCP extends McpAgent<Env> {
 			}
 		);
 
-		/* ── AI image generation — Google Imagen 4, added to the media
-		 * library server-side (downscaled + recompressed as JPEG). The
-		 * Imagen API key lives only in the WordPress server's own
-		 * environment (GEMINI_API_KEY) — never passed through this tool. ── */
+		/* ── Media sideload — pulls an arbitrary URL into the WP media
+		 * library (download_url()/media_handle_sideload() on the bridge
+		 * side) and returns a permanent minicad.io attachment URL + id. No
+		 * confirm required — this is a plain, reversible create, same class
+		 * of action as wp_post_create. ── */
+		this.server.tool(
+			"mc_media_sideload",
+			"Download an image from a URL into the WordPress media library and return a permanent minicad.io URL + attachment id. Optionally attaches it to a post and/or sets it as that post's featured image.",
+			{
+				source_url: z.string().url().describe("Publicly reachable image URL to download"),
+				filename: z.string().min(1).describe("Slug base for the file, no extension, e.g. 'cad-design-pricing-1'"),
+				alt_text: z.string().min(1).describe("Keyword-rich alt text for accessibility/SEO"),
+				post_id: z.number().int().optional().describe("Attach the sideloaded attachment to this post"),
+				set_as_featured: z.boolean().optional().describe("Set this image as post_id's featured image. Requires post_id. Defaults to false."),
+			},
+			{ readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+			async ({ source_url, filename, alt_text, post_id, set_as_featured }) => {
+				const r = await wp(env, `/media/sideload`, {
+					method: "POST",
+					body: { source_url, filename, alt_text, post_id, set_as_featured },
+					timeoutMs: MEDIA_SIDELOAD_TIMEOUT_MS,
+				});
+				return r.ok ? toolResult(r.data) : toolError(r.status, r.data);
+			}
+		);
+
+		/* ── AI image generation — Rendobar's image.generate job, downloaded
+		 * and added to the media library server-side via the same sideload
+		 * path as mc_media_sideload. The Rendobar API key lives only in the
+		 * WordPress server's own environment (RENDOBAR_API_KEY) — never
+		 * passed through this tool. ── */
 		this.server.tool(
 			"mc_ai_image_create",
-			"Generate a photorealistic image with Google Imagen 4 and add it to the WordPress media library (auto-downscaled to a max 1600px edge, recompressed as JPEG for PageSpeed). Optionally attaches it to a post and/or sets it as that post's featured image. Returns the attachment ID and public minicad.io URL for embedding in post HTML. On a content-policy refusal or API error, returns a clear error string — fall back to a stock photo (e.g. Pexels) for that slot rather than retrying blindly. Costs ~$0.04/image. Requires confirm:true.",
+			"Generate a photorealistic image with Rendobar (image.generate) and add it to the WordPress media library. Optionally attaches it to a post and/or sets it as that post's featured image. Returns the attachment ID and public minicad.io URL for embedding in post HTML. On a content-policy refusal or API error, returns a clear error string — fall back to a stock photo (e.g. Pexels) for that slot rather than retrying blindly. Requires confirm:true.",
 			{
-				prompt: z.string().min(1).describe("Photorealistic scene description for Imagen"),
+				prompt: z.string().min(1).describe("Photorealistic scene description for Rendobar"),
 				filename: z.string().min(1).describe("Slug base for the file, no extension, e.g. 'cad-design-pricing-1'"),
 				alt_text: z.string().min(1).describe("Keyword-rich alt text for accessibility/SEO"),
 				aspect_ratio: z.enum(["16:9", "4:3", "1:1", "3:4", "9:16"]).default("16:9"),
